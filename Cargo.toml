@@ -1,0 +1,15 @@
+[package]
+name = "rpi_eink_driver"
+version = "0.1.0"
+edition = "2024"
+
+[build]
+target = "aarch64-unknown-linux-gnu"
+
+[build.aarch64-unknown-linux-gnu]
+
+[dependencies]
+rand = "0.10.1"
+rppal = "0.22.1"
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "sync", "time"] }
+# placeholder
