@@ -88,9 +88,9 @@ enum SpiFlag {
 }
 
 impl Display {
-    pub fn new(pin_setup: DisplayPins) -> Result<Self> {
+    pub async fn new(pin_setup: DisplayPins) -> Result<Self> {
         let gpio_handle = Gpio::new().map_err(std::io::Error::other)?;
-        Ok(Display {
+        let inst = Display {
             //pins: pin_setup,
             spi: RwLock::new(
                 Spi::new(
@@ -133,7 +133,7 @@ impl Display {
                             ));
                         }
                     },
-                    5 * 1024 * 1024,
+                    1 * 1024 * 1024,
                     spi::Mode::Mode0,
                 )
                 .map_err(std::io::Error::other)?,
@@ -170,12 +170,32 @@ impl Display {
                     .into_output_high(),
             ),
             _gpio: gpio_handle,
-        })
+        };
+        inst.init().await?;
+        Ok(inst)
     }
-    pub async fn init(&self) -> Result<()> {
+    pub(crate) async fn test_write(&self) -> Result<()> {
+        self.signal(SpiFlag::XSeek, &[0x00]).await?;
+        self.signal(SpiFlag::YSeek, &[0xF9]).await?;
+        for y in 0..=0xf9u8 {
+            for x in 0..=0x0fu8 {
+                for i in 0..=8 {
+                    self.signal(SpiFlag::XSeek, &[x]).await?;
+                    self.signal(SpiFlag::XWindow, &[x, x + 1]).await?;
+                    self.signal(SpiFlag::YSeek, &[y]).await?;
+                    self.signal(SpiFlag::YWindow, &[y, y + 1]).await?;
+                    self.signal(SpiFlag::WriteRAM, &[(2u16.pow(i) - 1) as u8])
+                        .await?;
+                    self.signal(SpiFlag::DisplayUpdateControlB, &[0xC7]).await?;
+                    self.signal(SpiFlag::Activate, &[]).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+    async fn init(&self) -> Result<()> {
         //Hard reset chip MCU
         self.reset().await?;
-        self.wait_for_availability().await;
         self.signal(SpiFlag::SWReset, &[]).await?;
 
         //ripped directly from the manufacturer's manual if this doesn't work we're fucked i guess
@@ -183,9 +203,9 @@ impl Display {
             .await?;
 
         //set motion
-        self.signal(SpiFlag::DataEntryMode, &[0b00000_0_11]).await?;
+        self.signal(SpiFlag::DataEntryMode, &[0b00000_0_01]).await?;
         self.signal(SpiFlag::XWindow, &[0x00, 0x0F]).await?;
-        self.signal(SpiFlag::YWindow, &[0x00, 0xF9]).await?;
+        self.signal(SpiFlag::YWindow, &[0xF9, 0x00]).await?;
 
         //set border waveform
         self.signal(SpiFlag::BorderWaveformCtl, &[0b0000_00_01])
@@ -195,31 +215,43 @@ impl Display {
 
         //seek to (0, 199)
         self.signal(SpiFlag::XSeek, &[0x00]).await?;
-        self.signal(SpiFlag::YSeek, &[0x00]).await?;
-        self.wait_for_availability().await;
+        self.signal(SpiFlag::YSeek, &[0xf9]).await?;
+        self.black_screen().await?;
+        self.white_screen().await?;
         Ok(())
     }
     pub async fn black_screen(&self) -> Result<()> {
-        //4000b stolen from example code
-        self.wait_for_availability().await;
-        let block = [0x00u8; 0x0f * 0xf9];
+        let block = [0x00u8; 4096];
+        self.signal(SpiFlag::XSeek, &[0x00]).await?;
+        self.signal(SpiFlag::YSeek, &[0xf9]).await?;
         self.signal(SpiFlag::WriteRAM, &block).await?;
         self.signal(SpiFlag::DisplayUpdateControlB, &[0xFF]).await?;
         self.signal(SpiFlag::Activate, &[]).await?;
         Ok(())
     }
     pub async fn white_screen(&self) -> Result<()> {
-        //4000b stolen from example code
-        self.wait_for_availability().await;
-        let block = [0xffu8; 0x0f * 0xf9];
+        let block = [0xffu8; 4096];
         self.signal(SpiFlag::XSeek, &[0x00]).await?;
+        self.signal(SpiFlag::YSeek, &[0xf9]).await?;
         self.signal(SpiFlag::WriteRAM, &block).await?;
         self.signal(SpiFlag::DisplayUpdateControlB, &[0xFF]).await?;
         self.signal(SpiFlag::Activate, &[]).await?;
         Ok(())
     }
-    pub async fn draw_px(&self, x: u8, y: u8, black: bool) {
-        todo!()
+    pub async fn draw_px(&self, x: u8, y: u8, black: bool) -> Result<()> {
+        self.signal(SpiFlag::XSeek, &[x]).await?;
+        self.signal(SpiFlag::YSeek, &[y]).await?;
+        self.signal(SpiFlag::WriteRAM, &[if black { 0x00 } else { 0xff }])
+            .await?;
+        self.signal(SpiFlag::DisplayUpdateControlB, &[0xC7]).await?;
+        self.signal(SpiFlag::Activate, &[]).await?;
+        Ok(())
+    }
+    /// Rewrites full ram to the display
+    pub async fn hard_refresh(&self) -> Result<()> {
+        self.signal(SpiFlag::DisplayUpdateControlB, &[0xFF]).await?;
+        self.signal(SpiFlag::Activate, &[]).await?;
+        Ok(())
     }
 
     /// Immediately returns if the display is ready for use or not
@@ -247,6 +279,7 @@ impl Display {
         if trailing_data.len() != 0 {
             self.write_data(&trailing_data).await?;
         }
+        self.wait_for_availability().await;
         Ok(())
     }
     async fn write_command(&self, command: u8) -> Result<()> {
@@ -263,9 +296,9 @@ impl Display {
     }
 }
 
-impl super::PeripheralDisplay for self::Display {
+impl super::PeripheralDisplay<bool> for self::Display {
     const BITS_PER_PIXEL: u8 = 1;
-    const DIMENSIONS: [u16; 2] = [16, 250];
+    const DIMENSIONS: [u16; 2] = [0x10 * 8, 0xf7];
     async fn show_img(&self, px: &[u8]) -> std::io::Result<()> {
         if (px.len() * 8)
             < (self::Display::DIMENSIONS[0]
@@ -280,14 +313,17 @@ impl super::PeripheralDisplay for self::Display {
         self.signal(SpiFlag::XSeek, &[0x00]).await?;
         self.signal(SpiFlag::YSeek, &[0x00]).await?;
         self.signal(SpiFlag::WriteRAM, px).await?;
-        self.wait_for_availability().await;
         self.signal(SpiFlag::DisplayUpdateControlB, &[0xFF]).await?;
         self.signal(SpiFlag::Activate, &[]).await?;
 
         Ok(())
     }
+
+    async fn draw_px(&self, x: u8, y: u8, color: bool) -> Result<()> {
+        todo!()
+    }
 }
-impl PartialRenderCapableDisplay<u8> for self::Display {
+impl PartialRenderCapableDisplay<u8, bool> for self::Display {
     const ORIGINAL_WINDOW: [u8; 4] = [0, 0x0f, 0, 0xf7];
     async fn partial_upd(&self, window: &[u8; 4], px: &[u8]) -> std::io::Result<()> {
         if ((window[1] - window[0]) as usize * (window[3] - window[2]) as usize) < px.len() {
@@ -301,7 +337,6 @@ impl PartialRenderCapableDisplay<u8> for self::Display {
         self.signal(SpiFlag::YWindow, &window[2..4]).await?;
         self.signal(SpiFlag::YSeek, &[window[2]]).await?;
         self.signal(SpiFlag::WriteRAM, px).await?;
-        self.wait_for_availability().await;
         self.signal(SpiFlag::DisplayUpdateControlB, &[0xFF]).await?;
         self.signal(SpiFlag::Activate, &[]).await?;
         self.signal(SpiFlag::XWindow, &self::Display::ORIGINAL_WINDOW[0..2])

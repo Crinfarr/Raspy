@@ -1,2 +1,6 @@
 /target
 Cargo.lock
+
+# indev files
+project.7z
+push.sh
